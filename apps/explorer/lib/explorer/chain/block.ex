@@ -1,12 +1,32 @@
 defmodule Explorer.Chain.Block.Schema do
-  @moduledoc false
+  @moduledoc """
+    Models blocks.
 
-  alias Explorer.Chain.{Address, Block, Hash, PendingBlockOperation, Transaction, Wei, Withdrawal}
+    Changes in the schema should be reflected in the bulk import module:
+    - Explorer.Chain.Import.Runner.Blocks
+  """
+  use Utils.CompileTimeEnvHelper, chain_type: [:explorer, :chain_type]
+
+  alias Explorer.Chain.{
+    Address,
+    Block,
+    Hash,
+    PendingBlockOperation,
+    Transaction,
+    Wei,
+    Withdrawal
+  }
+
+  alias Explorer.Chain.Arbitrum.BatchBlock, as: ArbitrumBatchBlock
   alias Explorer.Chain.Block.{Reward, SecondDegreeRelation}
+  alias Explorer.Chain.Celo.EpochReward, as: CeloEpochReward
+  alias Explorer.Chain.Optimism.TransactionBatch, as: OptimismTransactionBatch
+  alias Explorer.Chain.Zilliqa.AggregateQuorumCertificate, as: ZilliqaAggregateQuorumCertificate
+  alias Explorer.Chain.Zilliqa.QuorumCertificate, as: ZilliqaQuorumCertificate
   alias Explorer.Chain.ZkSync.BatchBlock, as: ZkSyncBatchBlock
 
-  @chain_type_fields (case Application.compile_env(:explorer, :chain_type) do
-                        "ethereum" ->
+  @chain_type_fields (case @chain_type do
+                        :ethereum ->
                           elem(
                             quote do
                               field(:blob_gas_used, :decimal)
@@ -15,7 +35,20 @@ defmodule Explorer.Chain.Block.Schema do
                             2
                           )
 
-                        "rsk" ->
+                        :optimism ->
+                          elem(
+                            quote do
+                              has_one(:op_transaction_batch, OptimismTransactionBatch,
+                                foreign_key: :l2_block_number,
+                                references: :number
+                              )
+
+                              has_one(:op_frame_sequence, through: [:op_transaction_batch, :frame_sequence])
+                            end,
+                            2
+                          )
+
+                        :rsk ->
                           elem(
                             quote do
                               field(:bitcoin_merged_mining_header, :binary)
@@ -27,7 +60,7 @@ defmodule Explorer.Chain.Block.Schema do
                             2
                           )
 
-                        "zksync" ->
+                        :zksync ->
                           elem(
                             quote do
                               has_one(:zksync_batch_block, ZkSyncBatchBlock, foreign_key: :hash, references: :hash)
@@ -35,6 +68,62 @@ defmodule Explorer.Chain.Block.Schema do
                               has_one(:zksync_commit_transaction, through: [:zksync_batch, :commit_transaction])
                               has_one(:zksync_prove_transaction, through: [:zksync_batch, :prove_transaction])
                               has_one(:zksync_execute_transaction, through: [:zksync_batch, :execute_transaction])
+                            end,
+                            2
+                          )
+
+                        :celo ->
+                          elem(
+                            quote do
+                              has_one(:celo_epoch_reward, CeloEpochReward, foreign_key: :block_hash, references: :hash)
+
+                              has_many(:celo_epoch_election_rewards, CeloEpochReward,
+                                foreign_key: :block_hash,
+                                references: :hash
+                              )
+                            end,
+                            2
+                          )
+
+                        :arbitrum ->
+                          elem(
+                            quote do
+                              field(:send_count, :integer)
+                              field(:send_root, Hash.Full)
+                              field(:l1_block_number, :integer)
+
+                              has_one(:arbitrum_batch_block, ArbitrumBatchBlock,
+                                foreign_key: :block_number,
+                                references: :number
+                              )
+
+                              has_one(:arbitrum_batch, through: [:arbitrum_batch_block, :batch])
+
+                              has_one(:arbitrum_commitment_transaction,
+                                through: [:arbitrum_batch, :commitment_transaction]
+                              )
+
+                              has_one(:arbitrum_confirmation_transaction,
+                                through: [:arbitrum_batch_block, :confirmation_transaction]
+                              )
+                            end,
+                            2
+                          )
+
+                        :zilliqa ->
+                          elem(
+                            quote do
+                              field(:zilliqa_view, :integer)
+
+                              has_one(:zilliqa_quorum_certificate, ZilliqaQuorumCertificate,
+                                foreign_key: :block_hash,
+                                references: :hash
+                              )
+
+                              has_one(:zilliqa_aggregate_quorum_certificate, ZilliqaAggregateQuorumCertificate,
+                                foreign_key: :block_hash,
+                                references: :hash
+                              )
                             end,
                             2
                           )
@@ -98,24 +187,31 @@ defmodule Explorer.Chain.Block do
   require Explorer.Chain.Block.Schema
 
   use Explorer.Schema
+  use Utils.CompileTimeEnvHelper, chain_type: [:explorer, :chain_type]
 
   alias Explorer.Chain.{Block, Hash, Transaction, Wei}
   alias Explorer.Chain.Block.{EmissionReward, Reward}
   alias Explorer.Repo
+  alias Explorer.Utility.MissingRangesManipulator
 
   @optional_attrs ~w(size refetch_needed total_difficulty difficulty base_fee_per_gas)a
-                  |> (&(case Application.compile_env(:explorer, :chain_type) do
-                          "rsk" ->
-                            &1 ++
-                              ~w(minimum_gas_price bitcoin_merged_mining_header bitcoin_merged_mining_coinbase_transaction bitcoin_merged_mining_merkle_proof hash_for_merged_mining)a
 
-                          "ethereum" ->
-                            &1 ++
-                              ~w(blob_gas_used excess_blob_gas)a
+  @chain_type_optional_attrs (case @chain_type do
+                                :rsk ->
+                                  ~w(minimum_gas_price bitcoin_merged_mining_header bitcoin_merged_mining_coinbase_transaction bitcoin_merged_mining_merkle_proof hash_for_merged_mining)a
 
-                          _ ->
-                            &1
-                        end)).()
+                                :ethereum ->
+                                  ~w(blob_gas_used excess_blob_gas)a
+
+                                :arbitrum ->
+                                  ~w(send_count send_root l1_block_number)a
+
+                                :zilliqa ->
+                                  ~w(zilliqa_view)a
+
+                                _ ->
+                                  ~w()a
+                              end)
 
   @required_attrs ~w(consensus gas_limit gas_used hash miner_hash nonce number parent_hash timestamp)a
 
@@ -150,17 +246,18 @@ defmodule Explorer.Chain.Block do
    * `size` - The size of the block in bytes.
    * `timestamp` - When the block was collated
    * `total_difficulty` - the total `difficulty` of the chain until this block.
+   * `refetch_needed` - `true` if block has missing data and has to be refetched.
    * `transactions` - the `t:Explorer.Chain.Transaction.t/0` in this block.
    * `base_fee_per_gas` - Minimum fee required per unit of gas. Fee adjusts based on network congestion.
-  #{case Application.compile_env(:explorer, :chain_type) do
-    "rsk" -> """
+  #{case @chain_type do
+    :rsk -> """
        * `bitcoin_merged_mining_header` - Bitcoin merged mining header on Rootstock chains.
        * `bitcoin_merged_mining_coinbase_transaction` - Bitcoin merged mining coinbase transaction on Rootstock chains.
        * `bitcoin_merged_mining_merkle_proof` - Bitcoin merged mining merkle proof on Rootstock chains.
        * `hash_for_merged_mining` - Hash for merged mining on Rootstock chains.
        * `minimum_gas_price` - Minimum block gas price on Rootstock chains.
       """
-    "ethereum" -> """
+    :ethereum -> """
        * `blob_gas_used` - The total amount of blob gas consumed by the transactions within the block.
        * `excess_blob_gas` - The running total of blob gas consumed in excess of the target, prior to the block.
       """
@@ -171,7 +268,7 @@ defmodule Explorer.Chain.Block do
 
   def changeset(%__MODULE__{} = block, attrs) do
     block
-    |> cast(attrs, @required_attrs ++ @optional_attrs)
+    |> cast(attrs, @required_attrs ++ @optional_attrs ++ @chain_type_optional_attrs)
     |> validate_required(@required_attrs)
     |> foreign_key_constraint(:parent_hash)
     |> unique_constraint(:hash, name: :blocks_pkey)
@@ -179,7 +276,7 @@ defmodule Explorer.Chain.Block do
 
   def number_only_changeset(%__MODULE__{} = block, attrs) do
     block
-    |> cast(attrs, @required_attrs ++ @optional_attrs)
+    |> cast(attrs, @required_attrs ++ @optional_attrs ++ @chain_type_optional_attrs)
     |> validate_required([:number])
     |> foreign_key_constraint(:parent_hash)
     |> unique_constraint(:hash, name: :blocks_pkey)
@@ -342,16 +439,48 @@ defmodule Explorer.Chain.Block do
 
   def uncle_reward_coef, do: @uncle_reward_coef
 
+  # Gets EIP-1559 config actual for the given block number.
+  # If not found, returns EIP_1559_BASE_FEE_MAX_CHANGE_DENOMINATOR and EIP_1559_ELASTICITY_MULTIPLIER env values.
+  #
+  # ## Parameters
+  # - `block_number`: The given block number.
+  #
+  # ## Returns
+  # - `{denominator, multiplier}` tuple.
+  @spec get_eip1559_config(non_neg_integer()) :: {non_neg_integer(), non_neg_integer()}
+  defp get_eip1559_config(block_number) do
+    with true <- Application.get_env(:explorer, :chain_type) == :optimism,
+         # credo:disable-for-next-line Credo.Check.Design.AliasUsage
+         config = Explorer.Chain.Optimism.EIP1559ConfigUpdate.actual_config_for_block(block_number),
+         false <- is_nil(config) do
+      config
+    else
+      _ ->
+        {Application.get_env(:explorer, :base_fee_max_change_denominator),
+         Application.get_env(:explorer, :elasticity_multiplier)}
+    end
+  end
+
   @doc """
   Calculates the gas target for a given block.
 
   The gas target represents the percentage by which the actual gas used is above or below the gas target for the block, adjusted by the elasticity multiplier.
   If the `gas_limit` is greater than 0, it calculates the ratio of `gas_used` to `gas_limit` adjusted by this multiplier.
+
+  The multiplier is read from the `EIP_1559_ELASTICITY_MULTIPLIER` env variable or from the `op_eip1559_config_updates` table
+  as a dynamic parameter (if OP Holocene upgrade is activated).
+
+  ## Parameters
+  - `block`: A map representing block for which the gas target should be calculated.
+
+  ## Returns
+  - A float value representing the gas target percentage.
   """
   @spec gas_target(t()) :: float()
   def gas_target(block) do
     if Decimal.compare(block.gas_limit, 0) == :gt do
-      elasticity_multiplier = Application.get_env(:explorer, :elasticity_multiplier)
+      {_, elasticity_multiplier} = get_eip1559_config(block.number)
+
       ratio = Decimal.div(block.gas_used, Decimal.div(block.gas_limit, elasticity_multiplier))
       ratio |> Decimal.sub(1) |> Decimal.mult(100) |> Decimal.to_float()
     else
@@ -381,11 +510,11 @@ defmodule Explorer.Chain.Block do
       gas_target = gas_limit / elasticity_multiplier
       base_fee_for_next_block = base_fee_per_gas + (base_fee_per_gas * gas_used_delta / gas_target / base_fee_max_change_denominator)
 
-  where elasticity_multiplier is an env variable `EIP_1559_ELASTICITY_MULTIPLIER`,
-  `gas_used_delta` is the difference between the actual gas used and the target gas
-  and `base_fee_max_change_denominator` is an env variable `EIP_1559_BASE_FEE_MAX_CHANGE_DENOMINATOR` that limits the maximum change of the base fee from one block to the next.
-
-
+  where `elasticity_multiplier` is an env variable `EIP_1559_ELASTICITY_MULTIPLIER` or the dynamic value
+  got from the `op_eip1559_config_updates` database table. The `gas_used_delta` is the difference between
+  the actual gas used and the target gas. The `base_fee_max_change_denominator` is an env variable
+  `EIP_1559_BASE_FEE_MAX_CHANGE_DENOMINATOR` (or the dynamic value got from the `op_eip1559_config_updates`
+  table) that limits the maximum change of the base fee from one block to the next.
   """
   @spec next_block_base_fee_per_gas :: Decimal.t() | nil
   def next_block_base_fee_per_gas do
@@ -404,8 +533,7 @@ defmodule Explorer.Chain.Block do
 
   @spec next_block_base_fee_per_gas(t()) :: Decimal.t() | nil
   def next_block_base_fee_per_gas(block) do
-    elasticity_multiplier = Application.get_env(:explorer, :elasticity_multiplier)
-    base_fee_max_change_denominator = Application.get_env(:explorer, :base_fee_max_change_denominator)
+    {base_fee_max_change_denominator, elasticity_multiplier} = get_eip1559_config(block.number)
 
     gas_target = Decimal.div(block.gas_limit, elasticity_multiplier)
 
@@ -420,4 +548,25 @@ defmodule Explorer.Chain.Block do
       |> Decimal.div(base_fee_max_change_denominator)
       |> Decimal.add(base_fee_per_gas_decimal)
   end
+
+  @spec set_refetch_needed(integer | [integer]) :: :ok
+  def set_refetch_needed(block_numbers) when is_list(block_numbers) do
+    query =
+      from(block in Block,
+        where: block.number in ^block_numbers,
+        # Enforce Block ShareLocks order (see docs: sharelocks.md)
+        order_by: [asc: block.hash],
+        lock: "FOR NO KEY UPDATE"
+      )
+
+    {_count, updated_numbers} =
+      Repo.update_all(
+        from(b in Block, join: s in subquery(query), on: b.hash == s.hash, select: b.number),
+        set: [refetch_needed: true, updated_at: Timex.now()]
+      )
+
+    MissingRangesManipulator.add_ranges_by_block_numbers(updated_numbers)
+  end
+
+  def set_refetch_needed(block_number), do: set_refetch_needed([block_number])
 end
